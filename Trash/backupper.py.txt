@@ -1,0 +1,53 @@
+import os
+import shutil
+import zipfile
+from pathlib import Path
+from datetime import datetime
+from fnmatch import fnmatch
+
+def load_gitignore_patterns(gitignore_path):
+    patterns = []
+    if gitignore_path.exists():
+        with gitignore_path.open('r', encoding='utf-8') as file:
+            patterns = [line.strip() for line in file if line.strip() and not line.startswith('#')]
+    return patterns
+
+def should_ignore(file_path, patterns, base_dir):
+    rel_path = os.path.relpath(file_path, base_dir)
+    return any(fnmatch(rel_path, pattern) for pattern in patterns)
+
+def copy_and_zip(src, dest):
+    src = Path(src).resolve()
+    dest = Path(dest).resolve()
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    zip_name = f'backup_{timestamp}.zip'
+    zip_path = dest / zip_name
+    readme_path = dest / 'readme.txt'
+    
+    gitignore_path = src / '.gitignore'
+    ignore_patterns = load_gitignore_patterns(gitignore_path)
+    
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, _, files in os.walk(src):
+            for file in files:
+                file_path = Path(root) / file
+                if should_ignore(file_path, ignore_patterns, src):
+                    continue
+                zipf.write(file_path, file_path.relative_to(src))
+    
+    with readme_path.open('w', encoding='utf-8') as readme:
+        readme.write(f'Copia realizada el: {timestamp}\n')
+        readme.write(f'Archivo ZIP creado: {zip_name}\n')
+    
+    print(f'Backup completado: {zip_path}')
+    print(f'Readme creado en: {readme_path}')
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Copia y comprime un directorio respetando .gitignore')
+    parser.add_argument('origen', type=str, help='Carpeta origen a copiar')
+    parser.add_argument('destino', type=str, help='Carpeta destino donde guardar el ZIP')
+    
+    args = parser.parse_args()
+    copy_and_zip(args.origen, args.destino)

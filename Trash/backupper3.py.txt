@@ -1,0 +1,292 @@
+import shutil
+import zipfile
+import logging
+from pathlib import Path
+from datetime import datetime
+from fnmatch import fnmatch
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+from colorama import init, Fore
+import hashlib
+import time
+import argparse
+import os
+
+# Initialize colorama for colored logging output
+init(autoreset=True)
+
+# Global counters for reporting
+files_copied = 0
+files_ignored = 0
+
+class ColoredFormatter(logging.Formatter):
+    """
+    Custom logging formatter that adds color to log messages based on the log level.
+    """
+    COLORS = {
+        'INFO': Fore.GREEN,
+        'WARNING': Fore.YELLOW,
+        'ERROR': Fore.RED,
+        'DEBUG': Fore.BLUE
+    }
+    
+    def format(self, record):
+        color = self.COLORS.get(record.levelname, Fore.WHITE)
+        record.msg = f"{color}{record.msg}{Fore.RESET}"
+        return super().format(record)
+
+def setup_logger():
+    """
+    Configures the logger with colored output and ensures the logging level shows everything.
+    """
+    handler = logging.StreamHandler()
+    formatter = ColoredFormatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    # Change log level to DEBUG to show all logs, including info, warnings, etc.
+    logging.basicConfig(level=logging.DEBUG, handlers=[handler])
+
+def load_gitignore_patterns(gitignore_path, base_dir):
+    """
+    Reads the `.gitignore` file and processes its patterns correctly.
+    
+    Any ambiguous entry (e.g., `.venv`) will be interpreted as:
+    - A file (`.venv`)
+    - A directory (`.venv/`) including all its contents
+
+    Args:
+        gitignore_path (Path): Path to the `.gitignore` file.
+        base_dir (Path): The base directory where the backup is being performed.
+
+    Returns:
+        list: A list of patterns to ignore (both files and directories).
+    """
+    patterns = []
+    if gitignore_path.exists():
+        with gitignore_path.open('r', encoding='utf-8') as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue  # Ignore comments and empty lines
+
+                pattern = base_dir / line  # Use pathlib to join paths correctly
+
+                # Handle patterns that end with '/' as directories
+                if line.endswith('/'):
+                    patterns.append(pattern)  # Treat as a directory and its contents
+                else:
+                    # Treat the entry as both a file and a directory
+                    patterns.append(pattern)  # As a file
+                    
+                    # Only add a directory if the pattern doesn't look like a file pattern
+                    # and it's not already a file with the name ".installed.cfg"
+                    if not any(c in line for c in ['*', '?', '[']) and not '.' in line.split('/')[-1]:
+                        patterns.append(pattern.with_name(pattern.name + '/'))  # As a directory
+
+    return patterns
+
+
+def should_ignore(file_path, patterns, base_dir):
+    """
+    Determines if a file should be ignored based on the `.gitignore` patterns.
+
+    Args:
+        file_path (Path): The file path to check.
+        patterns (list): The list of patterns to ignore.
+        base_dir (Path): The base directory.
+
+    Returns:
+        bool: True if the file should be ignored, False otherwise.
+    """
+    abs_path = file_path.resolve()  # Use pathlib to get the absolute path
+    rel_path = abs_path.relative_to(base_dir)  # Get the relative path to base_dir
+
+    for pattern in patterns:
+        try:
+            # Log the patterns being compared for debugging
+            logging.debug(f"Comparing {rel_path} with pattern {pattern}")
+            
+            # Compare with the full relative path first
+            if fnmatch(str(rel_path), str(pattern)):
+                logging.info(f"Ignoring {file_path} based on pattern {pattern}")
+                return True
+
+            # Compare with the file name (in case the pattern is only the file name)
+            if fnmatch(file_path.name, pattern.name):
+                logging.info(f"Ignoring {file_path} based on pattern {pattern}")
+                return True
+        except Exception as e:
+            logging.error(f"Error comparing {rel_path} with pattern {pattern}: {e}")
+
+    return False
+
+def copy_file(src_file, temp_dir, base_dir):
+    """
+    Copies a file from the source directory to a temporary backup directory.
+
+    Args:
+        src_file (Path): The source file to be copied.
+        temp_dir (Path): The temporary directory where files are being copied.
+        base_dir (Path): The base source directory.
+    """
+    global files_copied
+    rel_path = src_file.relative_to(base_dir)
+    dest_file = temp_dir / rel_path
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_file, dest_file)
+    files_copied += 1
+    logging.info(f'File copied: {src_file}')
+
+def calculate_sha256(file):
+    """
+    Calculates the SHA-256 hash of a file for integrity verification.
+
+    Args:
+        file (Path): The file to compute the hash for.
+
+    Returns:
+        str: The SHA-256 hash of the file.
+    """
+    sha256_hash = hashlib.sha256()
+    with open(file, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+def verify_integrity(zip_path, original_hash):
+    """
+    Verifies the integrity of the ZIP file by comparing its calculated SHA-256 hash
+    with the original hash stored during the backup process.
+
+    Args:
+        zip_path (Path): Path to the ZIP file.
+        original_hash (str): The expected SHA-256 hash.
+
+    Returns:
+        None
+    """
+    calculated_hash = calculate_sha256(zip_path)
+    if calculated_hash == original_hash:
+        logging.info("✅ The ZIP file is valid and has not been modified.")
+    else:
+        logging.error("❌ The ZIP file has been altered or is corrupted!")
+
+def copy_and_zip(src, dest, verify=False, comment=None):
+    """
+    Copies files from the source directory to a temporary directory, compresses them into a ZIP file,
+    and optionally verifies the integrity of the ZIP file by checking its SHA-256 hash.
+
+    Args:
+        src (str): Path to the source directory.
+        dest (str): Path to the destination directory where the ZIP file will be saved.
+        verify (bool): If True, verifies the ZIP file integrity.
+        comment (str): A comment or note to be added to the readme.txt file.
+
+    Returns:
+        None
+    """
+    global files_copied, files_ignored
+    start_time = time.time()
+
+    setup_logger()
+
+    logging.debug("Starting the backup process.")  # Log the start of the process
+
+    src = Path(src).resolve()
+    dest = Path(dest).resolve()
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    zip_name = f'backup_{timestamp}.zip'
+    zip_path = dest / zip_name
+    readme_path = dest / 'readme.txt'
+    temp_dir = dest / f'temp_backup_{timestamp}'
+    
+    gitignore_path = src / '.gitignore'
+    ignore_patterns = load_gitignore_patterns(gitignore_path, src)
+
+    # Efficiently scan files while ignoring entire directories
+    files_to_copy = []
+    for root, dirs, files in os.walk(src):
+        root_path = Path(root)
+
+        # Remove ignored directories from `dirs` to prevent os.walk() from entering them
+        dirs[:] = [d for d in dirs if not should_ignore(root_path / d, ignore_patterns, src)]
+
+        for file in files:
+            file_path = root_path / file
+            if should_ignore(file_path, ignore_patterns, src):
+                logging.warning(f'Ignored: {file_path}')
+                files_ignored += 1
+                continue
+            files_to_copy.append(file_path)
+
+    logging.debug(f"Total files to copy: {len(files_to_copy)}")  # Log the number of files to copy
+
+    with ThreadPoolExecutor() as executor:
+        list(tqdm(executor.map(lambda f: copy_file(f, temp_dir, src), files_to_copy),
+                  total=len(files_to_copy), desc="Copying files"))
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for file in tqdm(temp_dir.rglob('*'), total=len(files_to_copy), desc="Compressing files"):
+            zipf.write(file, file.relative_to(temp_dir))
+
+    shutil.rmtree(temp_dir)
+
+    zip_hash = calculate_sha256(zip_path)
+
+    # Write information to the readme.txt file
+    with readme_path.open('w', encoding='utf-8') as readme:
+        readme.write(f'Backup created on: {timestamp}\n')
+        readme.write(f'ZIP file created: {zip_name}\n')
+        readme.write(f'SHA-256 hash of the ZIP file: {zip_hash}\n')
+        if comment:
+            readme.write(f'Comment: {comment}\n')  # Add the comment if provided
+
+    logging.info(f'Backup completed: {zip_path}')
+    logging.info(f'Readme created at: {readme_path}')
+    logging.info(f'SHA-256 hash of the ZIP file: {zip_hash}')
+
+    if verify:
+        logging.info("Verifying the integrity of the ZIP file...")
+        verify_integrity(zip_path, zip_hash)
+
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    # Print summary of the process
+    logging.info(f"\nBackup Report:")
+    logging.info(f"-------------------------------")
+    logging.info(f"Time taken: {total_time:.2f} seconds")
+    logging.info(f"Files copied: {files_copied}")
+    logging.info(f"Files ignored: {files_ignored}")
+    logging.info(f"Source directory: {src}")
+    logging.info(f"Destination directory: {dest}")
+    logging.info(f"Size of the ZIP file: {os.path.getsize(zip_path) / (1024 * 1024):.2f} MB")
+
+    # Show the SHA-256 hash if 'verify' is true
+    if verify:
+        logging.info(f"SHA-256 hash of the ZIP file: {zip_hash}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Backup a directory while respecting .gitignore. This script allows you to backup directories, '
+                    'compress them into a ZIP file, and optionally verify the integrity of the ZIP file.')
+    
+    # Argument for source directory to backup
+    parser.add_argument('source', type=str, help='Path to the source directory to backup')
+    
+    # Argument for destination directory to store the backup ZIP file
+    parser.add_argument('destination', type=str, help='Path to the destination directory where the ZIP file will be saved')
+    
+    # Optional argument to verify the integrity of the backup ZIP file by comparing its SHA-256 hash
+    parser.add_argument('--verify', action='store_true', help='If specified, verify the integrity of the ZIP file after creation')
+
+    # Optional argument to add a comment describing the content of the backup
+    parser.add_argument('--comment', type=str, help='A description or comment to add to the readme.txt file')
+    
+    # Parse the arguments
+    args = parser.parse_args()
+    
+    # Run the backup and zip process with the parsed arguments
+    copy_and_zip(args.source, args.destination, verify=args.verify, comment=args.comment)
